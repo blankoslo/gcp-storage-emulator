@@ -21,6 +21,7 @@ POST = "POST"
 PUT = "PUT"
 DELETE = "DELETE"
 PATCH = "PATCH"
+OPTIONS = "OPTIONS"
 
 # Sentinel so Request.data can cache falsy bodies (None, {}, b"").
 _UNSET = object()
@@ -236,11 +237,11 @@ def _decode_raw_data(raw_data, request_handler):
     return raw_data
 
 
-def _read_data(request_handler, query):
+def _read_data(request_handler, query, parse=True):
     raw_data = _decode_raw_data(_read_raw_data(request_handler), request_handler)
 
-    if not raw_data:
-        return None
+    if not raw_data or not parse:
+        return raw_data
 
     content_type = (
         request_handler.headers.get("Content-Type") or "application/octet-stream"
@@ -299,6 +300,7 @@ class Request(object):
         # Use a sentinel: empty JSON ({}) and missing bodies (None) are falsy, and
         # re-reading the socket hangs (Node createWriteStream sends metadata as {}).
         self._data = _UNSET
+        self._raw_data = _UNSET
         self._parsed_params = None
 
     @property
@@ -337,6 +339,18 @@ class Request(object):
         if self._data is _UNSET:
             self._data = _read_data(self._request_handler, self._query)
         return self._data
+
+    @property
+    def raw_data(self):
+        """Request body as decoded bytes, never JSON/multipart-parsed.
+
+        Media upload endpoints (e.g. the XML PUT upload) store the body verbatim
+        regardless of Content-Type, since that header only describes the object's
+        content type, not the request's wire format.
+        """
+        if self._raw_data is _UNSET:
+            self._raw_data = _read_data(self._request_handler, self._query, parse=False)
+        return self._raw_data
 
     def get_header(self, key, default=None):
         return self._request_handler.headers.get(key, default)
@@ -390,6 +404,74 @@ class Response(object):
         self._handler.wfile.write(content)
 
 
+def _cors_rule_for(storage, bucket_name, origin, method):
+    """First configured CORS rule on ``bucket_name`` matching ``origin``/``method``.
+
+    https://cloud.google.com/storage/docs/cross-origin#configuration-format
+    """
+    if not bucket_name or not origin or not method:
+        return None
+    bucket = storage.buckets.get(bucket_name)
+    if not bucket:
+        return None
+    for rule in bucket.get("cors") or []:
+        origins = rule.get("origin") or []
+        methods = rule.get("method") or []
+        if ("*" in origins or origin in origins) and ("*" in methods or method in methods):
+            return rule
+    return None
+
+
+def _bucket_name_for_path(path):
+    for regex, _ in HANDLERS:
+        match = re.compile(regex).fullmatch(path)
+        if match:
+            return match.groupdict().get("bucket_name")
+    return None
+
+
+def _apply_actual_cors_headers(response, request, storage):
+    origin = request.get_header("Origin")
+    if not origin:
+        return
+    bucket_name = (request.params or {}).get("bucket_name")
+    rule = _cors_rule_for(storage, bucket_name, origin, request.method)
+    if not rule:
+        return
+    allow_origin = "*" if "*" in (rule.get("origin") or []) else origin
+    response["Access-Control-Allow-Origin"] = allow_origin
+    if allow_origin != "*":
+        response["Vary"] = "Origin"
+    response_headers = rule.get("responseHeader") or []
+    if response_headers:
+        response["Access-Control-Expose-Headers"] = ", ".join(response_headers)
+
+
+def _handle_preflight(request, response, storage):
+    origin = request.get_header("Origin")
+    requested_method = request.get_header("Access-Control-Request-Method")
+    if not origin or not requested_method:
+        return
+    bucket_name = _bucket_name_for_path(request.path)
+    rule = _cors_rule_for(storage, bucket_name, origin, requested_method)
+    if not rule:
+        return
+    allow_origin = "*" if "*" in (rule.get("origin") or []) else origin
+    response["Access-Control-Allow-Origin"] = allow_origin
+    if allow_origin != "*":
+        response["Vary"] = "Origin"
+    methods = rule.get("method") or []
+    response["Access-Control-Allow-Methods"] = (
+        ", ".join(methods) if methods and "*" not in methods else requested_method
+    )
+    requested_headers = request.get_header("Access-Control-Request-Headers")
+    if requested_headers:
+        response["Access-Control-Allow-Headers"] = requested_headers
+    max_age = rule.get("maxAgeSeconds")
+    if max_age is not None:
+        response["Access-Control-Max-Age"] = str(max_age)
+
+
 class Router(object):
     def __init__(self, request_handler):
         super().__init__()
@@ -402,6 +484,11 @@ class Router(object):
 
         request = Request(self._request_handler, method)
         response = Response(self._request_handler)
+
+        if method == OPTIONS:
+            _handle_preflight(request, response, self._request_handler.storage)
+            response.close()
+            return
 
         for regex, handlers in HANDLERS:
             pattern = re.compile(regex)
@@ -441,6 +528,9 @@ class Router(object):
                     )
                     logger.error(e)
                     raise e
+                _apply_actual_cors_headers(
+                    response, request, self._request_handler.storage
+                )
                 break
         else:
             logger.error(
@@ -475,6 +565,10 @@ class RequestHandler(server.BaseHTTPRequestHandler):
     def do_PATCH(self):
         router = Router(self)
         router.handle(PATCH)
+
+    def do_OPTIONS(self):
+        router = Router(self)
+        router.handle(OPTIONS)
 
     def log_message(self, format, *args):
         logger.info(format % args)

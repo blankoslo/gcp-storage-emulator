@@ -300,19 +300,20 @@ def _patch(storage, bucket_name, object_id, metadata):
 
 def xml_upload(request, response, storage, *args, **kwargs):
     content_type = request.get_header("Content-Type", "application/octet-stream")
+    data = request.raw_data or b""
     obj = _make_object_resource(
         request.base_url,
         request.params["bucket_name"],
         request.params["object_id"],
         content_type,
-        str(len(request.data)),
+        str(len(data)),
     )
     try:
-        obj = _checksums(request.data, obj)
+        obj = _checksums(data, obj)
         storage.create_file(
             request.params["bucket_name"],
             request.params["object_id"],
-            request.data,
+            data,
             obj,
         )
 

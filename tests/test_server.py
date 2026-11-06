@@ -1582,6 +1582,26 @@ class ObjectsTests(ServerBaseCase):
             response = requests.put(url, data=file)
             self.assertEqual(response.status_code, 404)
 
+    def test_signed_url_upload_json_content_type(self):
+        """A PUT upload's body must be stored verbatim even when its
+        Content-Type is application/json, not parsed as a JSON API request."""
+        content = b'[{"a": 1}]'
+        bucket = self._client.create_bucket("testbucket")
+        blob = bucket.blob("signed-upload.json")
+        url = blob.generate_signed_url(
+            api_access_endpoint="http://localhost:9023",
+            credentials=FakeSigningCredentials(),
+            version="v4",
+            expiration=datetime.timedelta(minutes=15),
+            method="PUT",
+        )
+        headers = {"Content-type": "application/json"}
+        response = requests.put(url, data=content, headers=headers)
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(blob.download_as_bytes(), content)
+        self.assertEqual(blob.content_type, "application/json")
+
     def test_initiate_resumable_upload_without_metadata(self):
         url = "http://127.0.0.1:9023/upload/storage/v1/b/test_bucket/o?"
         url += "uploadType=resumable&name=test_file"
@@ -1723,3 +1743,75 @@ class HttpEndpointsTest(ServerBaseCase):
         self.assertEqual(fetched_bucket.name, bucket.name)
         with self.assertRaises(NotFound):
             fetched_bucket.blob(blob_path).download_as_text()
+
+
+class CorsTests(ServerBaseCase):
+    """CORS headers follow each bucket's configured ``cors`` metadata."""
+
+    def _url(self, path):
+        return os.environ["STORAGE_EMULATOR_HOST"] + path
+
+    def _bucket_with_cors(self, name, origin="http://allowed.example"):
+        bucket = self._client.create_bucket(name)
+        bucket.cors = [
+            {
+                "origin": [origin],
+                "method": ["GET"],
+                "responseHeader": ["Content-Type"],
+                "maxAgeSeconds": 1800,
+            }
+        ]
+        bucket.patch()
+        return bucket
+
+    def test_preflight_allowed_origin(self):
+        bucket = self._bucket_with_cors("corsbucket")
+        blob = bucket.blob("something.txt")
+        blob.upload_from_string("content")
+
+        response = requests.options(
+            self._url("/corsbucket/something.txt"),
+            headers={
+                "Origin": "http://allowed.example",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "http://allowed.example")
+        self.assertIn("GET", response.headers["Access-Control-Allow-Methods"])
+        self.assertEqual(response.headers["Access-Control-Max-Age"], "1800")
+
+    def test_preflight_disallowed_origin_omits_headers(self):
+        bucket = self._bucket_with_cors("corsbucket2")
+        blob = bucket.blob("something.txt")
+        blob.upload_from_string("content")
+
+        response = requests.options(
+            self._url("/corsbucket2/something.txt"),
+            headers={
+                "Origin": "http://evil.example",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
+
+    def test_actual_response_carries_cors_headers(self):
+        bucket = self._bucket_with_cors("corsbucket3")
+        blob = bucket.blob("something.txt")
+        blob.upload_from_string("content")
+
+        response = requests.get(
+            self._url("/corsbucket3/something.txt"),
+            headers={"Origin": "http://allowed.example"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "http://allowed.example")
+        self.assertEqual(response.headers["Access-Control-Expose-Headers"], "Content-Type")
+
+    def test_actual_response_without_origin_has_no_cors_headers(self):
+        bucket = self._bucket_with_cors("corsbucket4")
+        blob = bucket.blob("something.txt")
+        blob.upload_from_string("content")
+
+        response = requests.get(self._url("/corsbucket4/something.txt"))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
